@@ -1,34 +1,8 @@
-# import tensorflow as tf
-# import tensorflow_hub as hub
-
-# class MoveNet:
-#     def __init__(self, model_url='https://tfhub.dev/google/movenet/multipose/lightning/1'):
-#         self.model = hub.load(model_url)
-#         self.movenet = self.model.signatures['serving_default']
-
-#     def preprocess_image(self, image):
-#         # 이미지 차원 확장 및 크기 조정
-#         preprocessed_image = tf.image.resize_with_pad(tf.expand_dims(image, axis=0), 352, 640)
-#         return tf.cast(preprocessed_image, dtype=tf.int32)
-
-#     def predict_keypoints(self, image):
-#         preprocessed_image = self.preprocess_image(image)
-#         results = self.movenet(preprocessed_image)
-#         keypoints = results['output_0'].numpy()[:, :, :51].reshape((6, 17, 3))
-#         return keypoints
-
-# if __name__ == "__main__":
-#     import cv2
-#     img = cv2.imread('test_image.jpg')
-#     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) 
-#     movenet = MoveNet()
-#     keypoints = movenet.predict_keypoints(img_rgb)
-#     print(keypoints)
-
 import numpy as np
 from pathlib import Path
 import cv2
 import argparse
+import os
 from openvino.runtime import Core
 from collections import namedtuple
 
@@ -43,6 +17,28 @@ KEYPOINT_DICT = {
     'left_wrist': 9, 'right_wrist': 10, 'left_hip': 11, 'right_hip': 12,
     'left_knee': 13, 'right_knee': 14, 'left_ankle': 15, 'right_ankle': 16
 }
+
+TRACK_COLORS = [(230, 25, 75),
+                (60, 180, 75),
+                (255, 225, 25),
+                (0, 130, 200),
+                (245, 130, 48),
+                (145, 30, 180),
+                (70, 240, 240),
+                (240, 50, 230),
+                (210, 245, 60),
+                (250, 190, 212),
+                (0, 128, 128),
+                (220, 190, 255),
+                (170, 110, 40),
+                (255, 250, 200),
+                (128, 0, 0),
+                (170, 255, 195),
+                (128, 128, 0),
+                (255, 215, 180),
+                (0, 0, 128),
+                (128, 128, 128)]
+
 LINES_BODY = [[4, 2], [2, 0], [0, 1], [1, 3], [10, 8], [8, 6], [6, 5], [5, 7], [7, 9],
               [6, 12], [12, 11], [11, 5], [12, 14], [14, 16], [11, 13], [13, 15]]
 
@@ -116,6 +112,7 @@ class MovenetMPOpenvino:
             self.padding = Padding(pad_w, 0, frame_width + pad_w, frame_height)
         # print(f"Padding: {self.padding}")
 
+
     def init_output(self):
         """출력 설정"""
         if self.output_path:
@@ -132,6 +129,32 @@ class MovenetMPOpenvino:
         padded = cv2.copyMakeBorder(frame, 0, self.padding.h, 0, self.padding.w, cv2.BORDER_CONSTANT, value=0)
         resized = cv2.resize(padded, (self.pd_w, self.pd_h), interpolation=cv2.INTER_AREA)
         return resized.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+    
+    def render_keypoints(self, frame, bodies):
+        """키포인트 렌더링"""
+        for body in bodies:
+            keypoints = body.keypoints.astype(int)  # 정수형으로 변환
+            keypoints_score = body.keypoints_score
+
+            # 키포인트를 연결하는 선 그리기
+            for line in LINES_BODY:
+                # 선을 이을 두 점의 인덱스 확인
+                if keypoints_score[line[0]] > self.score_thresh and keypoints_score[line[1]] > self.score_thresh:
+                    pt1 = tuple(keypoints[line[0], :2])  # (x, y)
+                    pt2 = tuple(keypoints[line[1], :2])  # (x, y)
+                    cv2.line(frame, pt1, pt2, (0, 255, 0), 2)  # 초록색 선
+
+            # 각 키포인트에 점 그리기
+            for i, kp in enumerate(keypoints):
+                if keypoints_score[i] > self.score_thresh:
+                    center = tuple(kp[:2])  # (x, y)
+                    cv2.circle(frame, center, 5, (0, 0, 255), -1)  # 빨간색 점
+
+
+    def save_frame(self, frame, frame_index):
+        """프레임을 파일로 저장"""
+        output_file = os.path.join("./received_images", f"frame_{frame_index:04d}.jpg")
+        cv2.imwrite(output_file, frame)
 
     def postprocess(self, inference_result, frame_shape):
         """추론 결과 후처리 및 좌표 복원"""
@@ -141,32 +164,29 @@ class MovenetMPOpenvino:
         for person_idx in range(result.shape[0]):
             person_data = result[person_idx]
             score = person_data[55]  # 각 사람의 신뢰도 점수
-            if score > self.score_thresh:
-                kps = person_data[:51].reshape(17, 3)
-                bbox = person_data[51:55].reshape(2, 2)
-                ymin, xmin, ymax, xmax = (bbox * [self.padding.padded_h, self.padding.padded_w]).flatten().astype(int)
+            # if score > self.score_thresh:
+            kps = person_data[:51].reshape(17, 3)
+            bbox = person_data[51:55].reshape(2, 2)
+            ymin, xmin, ymax, xmax = (bbox * [self.padding.padded_h, self.padding.padded_w]).flatten().astype(int)
 
-                kps[:, 0] = kps[:, 0] * self.padding.padded_w
-                kps[:, 1] = kps[:, 1] * self.padding.padded_h
-                kps[:, 0] -= self.padding.w
-                kps[:, 1] -= self.padding.h
-                kps[:, 0] = np.clip(kps[:, 0], 0, frame_shape[1] - 1)
-                kps[:, 1] = np.clip(kps[:, 1], 0, frame_shape[0] - 1)
+            kps[:, 0] = kps[:, 0] * self.padding.padded_w
+            kps[:, 1] = kps[:, 1] * self.padding.padded_h
 
-                # 키포인트 배열을 (x, y, confidence)로 설정
-                keypoints_with_confidence = np.hstack([kps[:, :2], kps[:, 2:3]])
+            # 키포인트 배열을 (x, y, confidence)로 설정
+            # keypoints_with_confidence = np.hstack([kps[:, :2], kps[:, 2:3]])
+            kps[:, [0, 1]] = kps[:, [1, 0]]
 
-                body = Body(
-                    score=score,
-                    xmin=xmin,
-                    ymin=ymin,
-                    xmax=xmax,
-                    ymax=ymax,
-                    keypoints_score=kps[:, 2],
-                    keypoints=keypoints_with_confidence.astype(float),
-                    keypoints_norm=kps[:, [1, 0]] / np.array([frame_shape[1], frame_shape[0]])
-                )
-                bodies.append(body)
+            body = Body(
+                score=score,
+                xmin=xmin,
+                ymin=ymin,
+                xmax=xmax,
+                ymax=ymax,
+                keypoints_score=kps[:, 2],
+                keypoints=kps.astype(float),
+                keypoints_norm=kps[:, [1, 0]] / np.array([frame_shape[1], frame_shape[0]])
+            )
+            bodies.append(body)
 
         return bodies
 
@@ -177,7 +197,7 @@ class MovenetMPOpenvino:
         """
         processed_frames = []
 
-        for frame in frames:
+        for i, frame in enumerate(frames):
             # 파일 경로일 경우 이미지를 로드
             if isinstance(frame, str):
                 frame = cv2.imread(frame)
@@ -189,6 +209,9 @@ class MovenetMPOpenvino:
             preprocessed = self.preprocess_frame(frame)
             inference_result = self.compiled_model([preprocessed])
             bodies = self.postprocess(inference_result, frame.shape)
+            self.render_keypoints(frame, bodies)
+            
+            self.save_frame(frame, i)
 
             # 추출된 keypoints (6, 17, 3) 형태로 정리
             frame_keypoints = np.zeros((6, 17, 3), dtype=np.float32)  # 6명의 사람, 17개 관절, (x, y, confidence)

@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import struct
 import time
-from flask import Flask, send_from_directory, render_template_string
+from flask import Flask, Response
 from collections import deque
 from movenet import MovenetMPOpenvino
 from tst import TSTModel
@@ -13,12 +13,8 @@ import torch
 # Flask application initialization
 app = Flask(__name__)
 
-# Image saving directory
-save_dir = './received_images'
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
-
 sliding_window = deque(maxlen=15)  # 최대 15개의 프레임 저장
+send_frames = []
 
 # Initialize MoveNet and TSTModel
 input_dim = 6 * 17 * 3  # MoveNet keypoints 차원: 6명의 사람 * 17개의 keypoints * (x, y, confidence)
@@ -28,52 +24,8 @@ tst = TSTModel(input_dim=input_dim, num_classes=num_classes).to('cpu')  # 모델
 tst.load_model("tst.pth")
 
 
-# HTML template for displaying images
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Received Images</title>
-</head>
-<body>
-    <h1>Received Images</h1>
-    {% if images %}
-        {% for image in images %}
-            <div>
-                <h3>{{ image }}</h3>
-                <img src="/images/{{ image }}" alt="{{ image }}" style="max-width: 300px; margin-bottom: 20px;">
-            </div>
-        {% endfor %}
-    {% else %}
-        <p>No images received yet.</p>
-    {% endif %}
-</body>
-</html>
-"""
-
-# Flask route to list images
-@app.route('/images', methods=['GET'])
-def list_images():
-    images = os.listdir(save_dir)
-    images.sort()  # Sort images
-    return render_template_string(HTML_TEMPLATE, images=images)
-
-# Flask route to serve individual images
-@app.route('/images/<filename>', methods=['GET'])
-def get_image(filename):
-    return send_from_directory(save_dir, filename)
-
-def process_frame(frames):
-    keypoints = movenet.run(frames)  # (6, 17, 3) 형태의 keypoints
-    # x, y, confidence를 포함하여 (1, 6*17*3) 형태로 변환
-    num_frames = keypoints.shape[0]
-    keypoints_flattened = keypoints.reshape(num_frames, -1)
-    return keypoints_flattened
-
 # Function to process frames in the sliding window
 def process_sliding_window(frames):
-    
     # MoveNet을 사용하여 키포인트 처리
     keypoints_batch = process_frame(frames)  # (15, 6*17*3)
 
@@ -82,11 +34,60 @@ def process_sliding_window(frames):
 
     # TSTModel로 예측
     results = tst.inference(tst_input)
-    print(f"Prediction results: {results}")
-    return results
+
+    # 가장 가능성 높은 클래스를 추출
+
+    # 프레임에 예측 결과 삽입
+    for frame in frames:
+        text = f"Class: {results}"
+        cv2.putText(
+            frame, text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA
+        )
+
+    return frames
+
+# Generate frames for real-time streaming
+def generate_frames():
+    global send_frames
+    while True:
+        if send_frames:
+            latest_frames = send_frames[-5:]  # 최신 프레임 최대 5개 가져오기
+            frames_encoded = []
+
+            for frame in latest_frames:
+                if frame is not None and isinstance(frame, np.ndarray):
+                    # 프레임을 JPEG로 인코딩
+                    _, buffer = cv2.imencode('.jpg', frame)
+                    frames_encoded.append(buffer.tobytes())
+                else:
+                    # 비어있거나 잘못된 프레임 처리
+                    frames_encoded.append(None)
+
+            for frame_bytes in frames_encoded:
+                if frame_bytes:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        else:
+            time.sleep(0.1)  # 슬라이딩 윈도우가 비어 있으면 잠시 대기
+
+
+# Flask route for real-time video feed
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+def process_frame(frames):
+    keypoints = movenet.run(frames)  # (6, 17, 3) 형태의 keypoints
+    # x, y, confidence를 포함하여 (1, 6*17*3) 형태로 변환
+    num_frames = keypoints.shape[0]
+    keypoints_flattened = keypoints.reshape(num_frames, -1)
+    return keypoints_flattened
+
 
 # Socket server function
 def socket_server():
+    global send_frames
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(('0.0.0.0', 5002))  # Listening on port 5002
@@ -114,8 +115,8 @@ def socket_server():
 
             # Receive data
             data = b""
-            while len(data) < msg_size:
-                packet = client_socket.recv(4096)
+            while len(data) <= msg_size:
+                packet = client_socket.recv(1024)
                 if not packet:
                     print("Received incomplete packet. Continuing...")
                     break
@@ -129,24 +130,17 @@ def socket_server():
             nparr = np.frombuffer(data, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
             if frame is not None:
-                # Save the image
                 buffer.append(frame)  # Add frame to the buffer
-
-                # When buffer has 5 frames, process and update sliding window
+                print("Hi")
                 if len(buffer) == 5:
                     if len(sliding_window) == 15:
-                        process_sliding_window(list(sliding_window))  # Process the sliding window
+                        send_frames = process_sliding_window(list(sliding_window))  # Process the sliding window
                         # Remove oldest frames to maintain max length of 15
                         for _ in range(len(buffer)):
                             sliding_window.popleft()
 
                     sliding_window.extend(buffer)  # Add 5 frames to the sliding window
                     buffer.clear()  # Clear the buffer
-
-                current_time = time.time()
-                filename = os.path.join(save_dir, f"received_frame_{current_time}.jpg")
-                # cv2.imwrite(filename, frame)
-                # print(f"Frame saved as {filename}")
             else:
                 print("Failed to decode frame. Continuing...")
 
@@ -156,6 +150,7 @@ def socket_server():
 
     client_socket.close()
     server_socket.close()
+
 
 # Run both socket server and Flask server
 if __name__ == "__main__":
@@ -167,3 +162,4 @@ if __name__ == "__main__":
 
     # Start the Flask server
     app.run(host='0.0.0.0', port=5000, debug=False)
+    
