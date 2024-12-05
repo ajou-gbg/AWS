@@ -98,6 +98,7 @@ def socket_server():
     print(f"Connection established with {client_address}")
     buffer = []
     while True:
+        time.sleep(0.01)
         try:
             # Receive data size
             packed_size = client_socket.recv(struct.calcsize('>Q'))
@@ -115,10 +116,11 @@ def socket_server():
 
             # Receive data
             data = b""
-            while len(data) <= msg_size:
-                packet = client_socket.recv(1024)
+            while len(data) < msg_size:
+                remaining = msg_size - len(data)
+                packet = client_socket.recv(4096 if remaining > 4096 else remaining)
                 if not packet:
-                    print("Received incomplete packet. Continuing...")
+                    print("Received incomplete packet. Ignoring remaining bytes...")
                     break
                 data += packet
 
