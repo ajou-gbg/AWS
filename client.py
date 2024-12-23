@@ -2,9 +2,14 @@ import requests
 import cv2
 import numpy as np
 import time
+from dotenv import load_dotenv
+import os
+
+# .env 파일 로드
+load_dotenv()
 
 # 서버 URL
-VIDEO_FEED_URL = "http://172.20.10.10:5000/video_feed"
+VIDEO_FEED_URL = os.getenv("VIDEO_FEED_URL")  # 비디오 피드 URL
 
 def stream_video():
     try:
